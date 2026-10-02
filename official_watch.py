@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 DATES = ["2026-12-17", "2026-12-18"]   # 入住日（各 1 泊，擇一即可）
 PREFERRED_DATE = "2026-12-17"          # 首選日：通知標題加 ★、優先度較高
 # 可接受的住法：(每間房大人數, 房間數)。任一種有空就通知
-PARTY_OPTIONS = [(2, 2), (4, 1)]       # 2人x2間、4人x1間
+PARTY_OPTIONS = [(2, 2), (4, 1), (2, 1)]   # 2人x2間、4人x1間、2人x1間（只有兩人成行）
 
 SITES = [
     # ---------- 核心 ----------
@@ -40,20 +40,19 @@ SITES = [
     {"name": "本館古勢起屋", "tier": "core", "engine": "489pro", "slug": "kosekikan"},
     {"name": "古勢起屋別館", "tier": "core", "engine": "489pro", "slug": "kosekiya"},
     {"name": "銀山荘",       "tier": "core", "engine": "489pro", "slug": "ginzanso"},
-    {"name": "古山閣",       "tier": "core", "engine": "yadosagashi", "verified": False,
+    {"name": "古山閣",       "tier": "core", "engine": "yadosagashi",
      # 宿さがし：搜尋條件用表單 POST 送出 → 用瀏覽器填表
      "home": "https://www.yado-sagashi.net/yoyaku/plan/index2.jsp?beg&all&yid=0046353751453"},
     {"name": "藤屋",         "tier": "core", "engine": "tabichat", "slug": "fujiyaginzan",
-     "parties": [(2, 2)]},  # 藤屋單間最多 3 人，只能 2人x2間
+     "parties": [(2, 2), (2, 1)]},  # 藤屋單間最多 3 人，沒有 4人x1間
     # ---------- 備案 ----------
     {"name": "瀧見舘",       "tier": "backup", "engine": "489pro", "slug": "takimikan"},
-    {"name": "永澤平八",     "tier": "backup", "engine": "hpdsp", "yad_no": "319755", "path": "heihachi",
-     "verified": False},
-    {"name": "旅籠いとうや", "tier": "backup", "engine": "yadosagashi", "verified": False,
+    {"name": "永澤平八",     "tier": "backup", "engine": "hpdsp", "yad_no": "319755", "path": "heihachi"},
+    {"name": "旅籠いとうや", "tier": "backup", "engine": "yadosagashi",
      # 與古山閣同一套系統（宿さがし）
      "home": "https://www.yado-sagashi.net/yoyaku/plan/index2.jsp?beg&all&yid=4116550506152"},
     # 旅館松本：官網訂房系統 (rwiths.net) 的 robots.txt 禁止自動存取，因此不放進官網爬蟲
-    {"name": "昭和館",       "tier": "backup", "engine": "liberty", "verified": False,
+    {"name": "昭和館",       "tier": "backup", "engine": "liberty",
      # Liberty 新系統：單頁式網站，頁面載入時會呼叫搜尋 API → 攔截並改成我們的日期與人數
      "home": "https://site.reservation.liberty-service.com/cc5f559e549f4f2fac443b9673014a37/facility-db690034-b45f-46b5-84d1-3f8ba4b8f522/search"},
 ]
@@ -451,10 +450,12 @@ FILL_YS_JS = r"""
 def check_yadosagashi(page, site, debug=False):
     """一室人數：2人x2間 → 查 2名（只能確認至少有一間 2 人房）；4人x1間 → 查 4名（或「3名以上」）。"""
     results = {}
+    per_room = sorted({a for a, r in site.get("parties", PARTY_OPTIONS)})  # 表單只能選「一室人數」
     for d in DATES:
         ds = d.replace("-", "/")
-        for adults, rooms in site.get("parties", PARTY_OPTIONS):
-            label = party_label(adults, rooms)
+        for adults in per_room:
+            rooms = 1
+            label = f"{adults}人房"
             page.goto(site["home"], wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(1500)
             info = page.evaluate(FILL_YS_JS, [ds, adults])
@@ -491,6 +492,33 @@ def check_yadosagashi(page, site, debug=False):
 LIBERTY_API = "**/api/booking/search**"
 
 
+def liberty_status(raw, ci):
+    """API 回應裡每個房型都有 appDatePrices；status.isAvailable=true 代表此日期、此人數可訂。"""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return UNKNOWN, "API 回應無法解析"
+    seen, ok = 0, 0
+
+    def walk(x):
+        nonlocal seen, ok
+        if isinstance(x, dict):
+            if x.get("appDateId") == ci and isinstance(x.get("status"), dict):
+                seen += 1
+                if x["status"].get("isAvailable"):
+                    ok += 1
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(data)
+    if seen == 0:
+        return UNKNOWN, "回應中找不到該日期"
+    return (AVAILABLE if ok else FULL), f"{ok}/{seen} 個房型方案可訂"
+
+
 def check_liberty(page, site, debug=False):
     results = {}
     for d in DATES:
@@ -506,10 +534,18 @@ def check_liberty(page, site, debug=False):
                     body = json.loads(request.post_data or "{}")
                     body["checkInDate"], body["checkOutDate"] = ci, win_end
                     body["roomNumber"], body["restNumber"] = rooms, 1
-                    g = body.get("guestsPerRoom") or []
+                    g = [e for e in (body.get("guestsPerRoom") or []) if e.get("roomGroupIndex", 0) == 0]
                     if g:
-                        body["guestsPerRoom"] = [dict(g[0], appDateId=ci, roomGroupIndex=i, persons=adults)
-                                                 for i in range(rooms)]
+                        adult_type = max(g, key=lambda e: e.get("persons", 0)).get("personAgeTypeId")
+                        rows = []
+                        for i in range(rooms):
+                            for e in g:
+                                is_adult = e.get("personAgeTypeId") == adult_type
+                                rows.append(dict(e, appDateId=ci, roomGroupIndex=i,
+                                                 persons=adults if is_adult else 0,
+                                                 femalePersons=adults // 2 if is_adult else 0,
+                                                 malePersons=adults - adults // 2 if is_adult else 0))
+                        body["guestsPerRoom"] = rows
                     cap["sent"] = json.dumps(body, ensure_ascii=False)
                     route.continue_(post_data=cap["sent"])
                 except Exception as ex:
@@ -539,8 +575,9 @@ def check_liberty(page, site, debug=False):
                 for mm in list(re.finditer(str(ci), raw))[:5]:
                     print("…" + raw[max(0, mm.start() - 300): mm.end() + 300] + "…")
                 print("--- 畫面文字 ---\n" + text[:1500])
-            results[f"{d} {label}"] = {"status": UNKNOWN, "fp": hashlib.md5(raw.encode()).hexdigest()[:10],
-                                       "url": site["home"], "detail": "判讀規則待校正"}
+            status, detail = liberty_status(raw, ci)
+            results[f"{d} {label}"] = {"status": status, "fp": hashlib.md5(raw.encode()).hexdigest()[:10],
+                                       "url": site["home"], "detail": detail}
             time.sleep(random.uniform(2, 4))
     return results
 
