@@ -75,6 +75,8 @@ NTFY_TOPIC = _clean_topic(os.environ.get("NTFY_TOPIC", ""))
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 STATE_FILE = os.environ.get("STATE_FILE", "official_state.json")
 JST = timezone(timedelta(hours=9))
+TW = timezone(timedelta(hours=8))
+HEARTBEAT_TIME = (12, 30)   # 每天台灣時間 12:30 後的第一次檢查，送一則「監測正常」通知
 
 AVAILABLE, PHONE, FULL, CLOSED, UNKNOWN, SKIPPED = "空室あり", "要電話", "満室", "受付不可", "無法判讀", "未設定"
 TIER_LABEL = {"core": "【核心】", "backup": "【備案】"}
@@ -593,6 +595,12 @@ def check_once(debug=False):
 
     state = load_state()
     summary = []
+    tw_now = datetime.now(TW)
+    today = tw_now.strftime("%Y-%m-%d")
+    meta = state.get("_meta", {})
+    if meta.get("date") != today:
+        meta = {"date": today, "runs": 0, "errors": 0, "heartbeat_sent": False}
+    counts = {"checks": 0, "avail": 0, "unknown": 0, "errors": 0}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo",
@@ -610,6 +618,7 @@ def check_once(debug=False):
             except Exception as e:
                 print(f"[{now()}] {site['name']} 檢查失敗：{str(e)[:200]}")
                 summary.append(f"{site['name']}：錯誤")
+                counts["errors"] += 1
                 continue
             for d, r in results.items():
                 key = f"{site['name']}|{d}"
@@ -617,6 +626,9 @@ def check_once(debug=False):
                 summary.append(f"{TIER_LABEL[tier]}{site['name']} {d[5:]}：{r['status']}")
                 if r["status"] == SKIPPED:
                     continue
+                counts["checks"] += 1
+                counts["avail"] += r["status"] in (AVAILABLE, PHONE)
+                counts["unknown"] += r["status"] == UNKNOWN
                 changed = bool(prev) and prev.get("fp") != r["fp"]
                 if r["status"] in (AVAILABLE, PHONE) and prev.get("status") != r["status"]:
                     extra = "（官網標示需打電話）" if r["status"] == PHONE else ""
@@ -627,6 +639,25 @@ def check_once(debug=False):
                            f"程式無法判讀，請手動看一下 {r['detail']}", click=r["url"], priority=3)
                 state[key] = {"status": r["status"], "fp": r["fp"], "at": now()}
         browser.close()
+
+    if not debug:
+        meta["runs"] += 1
+        meta["errors"] += counts["errors"]
+        if not meta["heartbeat_sent"] and (tw_now.hour, tw_now.minute) >= HEARTBEAT_TIME:
+            n_sites = len(SITES)
+            if counts["avail"]:
+                status_line = f"⚠ 目前有 {counts['avail']} 項顯示有空房，請查看先前的通知"
+            else:
+                status_line = f"{n_sites} 間旅館皆滿房"
+            extra = []
+            if counts["unknown"]:
+                extra.append(f"{counts['unknown']} 項無法判讀")
+            if meta["errors"]:
+                extra.append(f"今天累計 {meta['errors']} 次網站讀取失敗")
+            msg = f"{status_line}。今天已檢查 {meta['runs']} 輪。" + ("（" + "、".join(extra) + "）" if extra else "")
+            notify("✅ 銀山溫泉監測正常運作中", msg, priority=2)
+            meta["heartbeat_sent"] = True
+        state["_meta"] = meta
     save_state(state)
     print("\n===== 本輪摘要 =====\n" + "\n".join(summary))
 
