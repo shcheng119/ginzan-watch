@@ -24,6 +24,7 @@ import os
 import random
 import re
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -39,32 +40,39 @@ SITES = [
     {"name": "本館古勢起屋", "tier": "core", "engine": "489pro", "slug": "kosekikan"},
     {"name": "古勢起屋別館", "tier": "core", "engine": "489pro", "slug": "kosekiya"},
     {"name": "銀山荘",       "tier": "core", "engine": "489pro", "slug": "ginzanso"},
-    {"name": "古山閣",       "tier": "core", "engine": "form",
-     # 宿さがし：搜尋用 POST 送出、網址不帶條件 → 用瀏覽器填表（填表規則待 debug 結果確認）
+    {"name": "古山閣",       "tier": "core", "engine": "yadosagashi", "verified": False,
+     # 宿さがし：搜尋條件用表單 POST 送出 → 用瀏覽器填表
      "home": "https://www.yado-sagashi.net/yoyaku/plan/index2.jsp?beg&all&yid=0046353751453"},
     {"name": "藤屋",         "tier": "core", "engine": "tabichat", "slug": "fujiyaginzan",
      "parties": [(2, 2)]},  # 藤屋單間最多 3 人，只能 2人x2間
     # ---------- 備案 ----------
     {"name": "瀧見舘",       "tier": "backup", "engine": "489pro", "slug": "takimikan"},
-    {"name": "永澤平八",     "tier": "backup", "engine": "hpdsp", "yad_no": "319755", "path": "heihachi"},
-    {"name": "旅籠いとうや", "tier": "backup", "engine": "form",
+    {"name": "永澤平八",     "tier": "backup", "engine": "hpdsp", "yad_no": "319755", "path": "heihachi",
+     "verified": False},
+    {"name": "旅籠いとうや", "tier": "backup", "engine": "yadosagashi", "verified": False,
      # 與古山閣同一套系統（宿さがし）
      "home": "https://www.yado-sagashi.net/yoyaku/plan/index2.jsp?beg&all&yid=4116550506152"},
     # 旅館松本：官網訂房系統 (rwiths.net) 的 robots.txt 禁止自動存取，因此不放進官網爬蟲
-    {"name": "昭和館",       "tier": "backup", "engine": "form",
-     # Liberty 新系統：單頁式網站、網址不變 → 用瀏覽器填表（填表規則待 debug 結果確認）
+    {"name": "昭和館",       "tier": "backup", "engine": "liberty", "verified": False,
+     # Liberty 新系統：單頁式網站，頁面載入時會呼叫搜尋 API → 攔截並改成我們的日期與人數
      "home": "https://site.reservation.liberty-service.com/cc5f559e549f4f2fac443b9673014a37/facility-db690034-b45f-46b5-84d1-3f8ba4b8f522/search"},
 ]
 
 # 通用模式（url 引擎）的判斷關鍵字；跑完 --debug 後可依實際頁面調整
-URL_SOLD_OUT = ["満室", "空室がありません", "空室なし", "該当するプランがありません",
+URL_SOLD_OUT = ["ご利用できるプランがない", "該当するプランはございません", "満室", "空室がありません", "空室なし", "該当するプランがありません",
                 "見つかりませんでした", "ご希望の条件に合う", "受付を終了", "販売終了",
                 "予約可能なプランがありません", "条件に合うプランがありません",
                 "Sold out", "No rooms available", "No plans available"]
 URL_AVAILABLE = ["予約する", "詳細・予約へ", "予約へ進む", "空室あり", "残り"]
 # ================================================================
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+def _clean_topic(raw):
+    t = (raw or "").strip()
+    t = re.sub(r"^https?://ntfy\.sh/", "", t).strip("/ ")
+    return t
+
+
+NTFY_TOPIC = _clean_topic(os.environ.get("NTFY_TOPIC", ""))
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 STATE_FILE = os.environ.get("STATE_FILE", "official_state.json")
 JST = timezone(timedelta(hours=9))
@@ -101,6 +109,12 @@ def notify(title, message, click=None, priority=5):
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
         urllib.request.urlopen(req, timeout=15).read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")[:300]
+        print(f"[{now()}] ntfy 推播失敗：HTTP {e.code} {body}")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", NTFY_TOPIC):
+            print(f"[{now()}] ⚠ NTFY_TOPIC 格式不對（長度 {len(NTFY_TOPIC)}）："
+                  "只能用英文字母、數字、- 和 _，不能有空格、中文或網址")
     except Exception as e:
         print(f"[{now()}] ntfy 推播失敗：{e}")
 
@@ -130,11 +144,12 @@ def safe_name(s):
 # 489pro 日曆圖例：空室あり / 満室 / お電話にてお問い合わせください / 受付できません
 # 下列關鍵字會同時比對格子的文字、CSS class、圖片 alt 與檔名。
 # 跑完 --debug 後若發現判讀不準，只需要改這裡。
+# 已用 debug 結果確認：fa-xmark=満室、fa-minus=受付不可、fa-circle=空室あり（▲残りわずか 也算有空房）
 RULES = [
-    (PHONE,     ["電話", "tel:", "phone", "icon_tel", "icon-tel"]),
-    (CLOSED,    ["受付できません", "受付不可", "closed", "disable", "－", "—"]),
-    (FULL,      ["満室", "×", "✕", "full", "soldout", "sold_out", "vacancy_none"]),
-    (AVAILABLE, ["空室あり", "○", "◯", "△", "残", "vacant", "available", "vacancy_ok"]),
+    (PHONE,     ["fa-phone", "電話", "tel:"]),
+    (CLOSED,    ["fa-minus", "受付できません"]),
+    (FULL,      ["fa-xmark", "満室", "×"]),
+    (AVAILABLE, ["fa-circle", "fa-triangle", "fa-caret-up", "fa-play", "空室あり", "○", "▲", "残"]),
 ]
 
 
@@ -274,6 +289,23 @@ def check_hpdsp(page, site, debug=False):
             results[f"{d} {label}"] = {"status": status, "fp": plan_fingerprint(text),
                                        "url": url, "detail": detail}
             time.sleep(random.uniform(2, 4))
+    if debug:
+        # 對照組：用一個較可能有空房的日期，確認網址裡的日期參數真的有被採用
+        for cd in ("2026-10-14", "2027-01-13"):
+            y, m, day = map(int, cd.split("-"))
+            url = (f"https://www.hpdsp.net/{site['path']}/hw/hwp3100/hww3101.do?yadNo={site['yad_no']}"
+                   f"&stayYear={y}&stayMonth={m}&stayDay={day}&stayCount=1&dateUndecided=0"
+                   f"&roomCount=1&adultNum=2&roomCrack=200000")
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(1500)
+            t = page.inner_text("body")
+            hit = re.search(r"全\s*\d+\s*件のプラン|ご利用できるプランがない", t)
+            print(f"--- {site['name']} 對照組 {cd} 2人x1間：{hit.group(0) if hit else '（無關鍵字）'}")
+            time.sleep(2)
+        fields = page.evaluate(DUMP_FORM_JS)
+        print(f"--- {site['name']} 表單結構 ---")
+        for f in fields:
+            print(json.dumps({k: v for k, v in f.items() if v}, ensure_ascii=False))
     return results
 
 
@@ -334,10 +366,14 @@ def check_tabichat(page, site, debug=False):
                 fn = f"debug_{safe_name(site['name'])}_{d}_{adults}x{rooms}.png"
                 page.screenshot(path=fn, full_page=True)
                 print(f"\n=== {site['name']} {d} {label}（截圖：{fn}）===\n{url}\n{text[:2000]}")
-            sold = any(k in text for k in URL_SOLD_OUT)
-            priced = re.search(r"\d[\d,]{3,}\s*円", text)
-            status = FULL if sold else AVAILABLE if priced else UNKNOWN
-            results[f"{d} {label}"] = {"status": status, "fp": plan_fingerprint(text), "url": url, "detail": ""}
+            # 已用 debug 結果確認：客滿時頁面顯示「お部屋 (0)」「プラン (0)」
+            m_plan = re.search(r"プラン\s*\((\d+)\)", text)
+            if m_plan:
+                status = AVAILABLE if int(m_plan.group(1)) > 0 else FULL
+            else:
+                status = UNKNOWN
+            results[f"{d} {label}"] = {"status": status, "fp": plan_fingerprint(text), "url": url,
+                                       "detail": m_plan.group(0) if m_plan else ""}
             time.sleep(random.uniform(2, 4))
     return results
 
@@ -386,8 +422,132 @@ def check_form(page, site, debug=False):
     return {}
 
 
+# ------------------------ 宿さがし（古山閣、旅籠いとうや） ------------------------
+FILL_YS_JS = r"""
+([ds, n]) => {
+  const ci = document.querySelector('#checkinday');
+  if (ci) { ci.removeAttribute('readonly'); ci.value = ds;
+            ci.dispatchEvent(new Event('change', {bubbles: true})); }
+  const fx = document.querySelector('input[name=fixed]');
+  if (fx) fx.checked = false;
+  const sel = document.querySelector('select[name=people]');
+  let chosen = '';
+  if (sel) {
+    let best = null, bestN = 0;
+    for (const o of sel.options) {
+      const m = o.text.match(/^(\d+)名/);
+      if (!m) continue;
+      const k = parseInt(m[1]);
+      if (k === n && !o.text.includes('以上')) { best = o; break; }
+      if (o.text.includes('以上') && k <= n && k > bestN) { best = o; bestN = k; }
+    }
+    if (best) { sel.value = best.value; chosen = best.text; }
+  }
+  return {date: ci ? ci.value : null, people: chosen};
+}
+"""
+
+
+def check_yadosagashi(page, site, debug=False):
+    """一室人數：2人x2間 → 查 2名（只能確認至少有一間 2 人房）；4人x1間 → 查 4名（或「3名以上」）。"""
+    results = {}
+    for d in DATES:
+        ds = d.replace("-", "/")
+        for adults, rooms in site.get("parties", PARTY_OPTIONS):
+            label = party_label(adults, rooms)
+            page.goto(site["home"], wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(1500)
+            info = page.evaluate(FILL_YS_JS, [ds, adults])
+            try:
+                with page.expect_navigation(timeout=30000):
+                    page.click("input[name=cmdKensaku]")
+            except Exception:
+                pass
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1500)
+            text = page.inner_text("body")
+            kept = page.evaluate("() => (document.querySelector('#checkinday') || {}).value || ''")
+            n_book = text.count("詳細・予約")
+            if debug:
+                fn = f"debug_{safe_name(site['name'])}_{d}_{adults}x{rooms}.png"
+                page.screenshot(path=fn, full_page=True)
+                print(f"\n=== {site['name']} {d} {label}（截圖：{fn}）===")
+                print(f"填入：{info}｜送出後日期欄：{kept!r}｜「詳細・予約」出現 {n_book} 次")
+                print(text[:1500])
+            if kept.replace("-", "/") != ds:
+                status, detail = UNKNOWN, f"日期沒有套用（{kept!r}）"
+            elif any(k in text for k in URL_SOLD_OUT):
+                status, detail = FULL, ""
+            else:
+                status = AVAILABLE if n_book > 0 else FULL
+                detail = f"{n_book} 個方案"
+            results[f"{d} {label}"] = {"status": status, "fp": plan_fingerprint(text),
+                                       "url": site["home"], "detail": detail}
+            time.sleep(random.uniform(2, 4))
+    return results
+
+
+# ------------------------ Liberty 新系統（昭和館） ------------------------
+LIBERTY_API = "**/api/booking/search**"
+
+
+def check_liberty(page, site, debug=False):
+    results = {}
+    for d in DATES:
+        ci = int(d.replace("-", ""))
+        win_end = int((datetime.strptime(d, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y%m%d"))
+        for adults, rooms in site.get("parties", PARTY_OPTIONS):
+            label = party_label(adults, rooms)
+            cap = {}
+
+            def handle(route, request):
+                try:
+                    cap["orig"] = request.post_data
+                    body = json.loads(request.post_data or "{}")
+                    body["checkInDate"], body["checkOutDate"] = ci, win_end
+                    body["roomNumber"], body["restNumber"] = rooms, 1
+                    g = body.get("guestsPerRoom") or []
+                    if g:
+                        body["guestsPerRoom"] = [dict(g[0], appDateId=ci, roomGroupIndex=i, persons=adults)
+                                                 for i in range(rooms)]
+                    cap["sent"] = json.dumps(body, ensure_ascii=False)
+                    route.continue_(post_data=cap["sent"])
+                except Exception as ex:
+                    cap["err"] = str(ex)
+                    route.continue_()
+
+            page.route(LIBERTY_API, handle)
+            try:
+                with page.expect_response(lambda r: "/api/booking/search" in r.url, timeout=60000) as ri:
+                    page.goto(site["home"], wait_until="domcontentloaded", timeout=60000)
+                resp = ri.value
+                raw = resp.text()
+                code = resp.status
+            except Exception as ex:
+                raw, code = "", f"error {ex}"
+            page.wait_for_timeout(4000)
+            page.unroute(LIBERTY_API, handle)
+            text = page.inner_text("body")
+            if debug:
+                fn = f"debug_{safe_name(site['name'])}_{d}_{adults}x{rooms}.png"
+                page.screenshot(path=fn, full_page=True)
+                print(f"\n=== {site['name']} {d} {label}（截圖：{fn}）===")
+                print(f"原始請求：{(cap.get('orig') or '')[:1500]}")
+                print(f"改寫後：{(cap.get('sent') or '')[:1500]}  錯誤：{cap.get('err')}")
+                print(f"API 回應 HTTP {code}，長度 {len(raw)}")
+                print(raw[:3000])
+                for mm in list(re.finditer(str(ci), raw))[:5]:
+                    print("…" + raw[max(0, mm.start() - 300): mm.end() + 300] + "…")
+                print("--- 畫面文字 ---\n" + text[:1500])
+            results[f"{d} {label}"] = {"status": UNKNOWN, "fp": hashlib.md5(raw.encode()).hexdigest()[:10],
+                                       "url": site["home"], "detail": "判讀規則待校正"}
+            time.sleep(random.uniform(2, 4))
+    return results
+
+
 ENGINES = {"489pro": check_489pro, "hpdsp": check_hpdsp, "url": check_url,
-           "tabichat": check_tabichat, "form": check_form}
+           "tabichat": check_tabichat, "form": check_form,
+           "yadosagashi": check_yadosagashi, "liberty": check_liberty}
 
 
 # ---------------------------- 主流程 ----------------------------
@@ -405,6 +565,9 @@ def check_once(debug=False):
             if i:
                 time.sleep(random.uniform(3, 6))  # 網站之間停一下，對伺服器客氣
             tier = site.get("tier", "core")
+            if not debug and site.get("verified") is False:
+                summary.append(f"{TIER_LABEL[tier]}{site['name']}：尚未啟用（等待校正）")
+                continue
             try:
                 results = ENGINES[site["engine"]](page, site, debug=debug)
             except Exception as e:
